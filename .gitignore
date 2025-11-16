@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# Local outputs
+output/
+monitoring.db
+
+# Virtual envs
+.venv/
+env/
+venv/

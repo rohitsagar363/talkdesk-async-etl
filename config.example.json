@@ -1,0 +1,22 @@
+{
+  "base_url": "https://api.talkdesk.com/api/v1",
+  "auth_endpoint": "/oauth/token",
+  "post_endpoint": "/reports/generate",
+  "get_endpoint": "/reports/download",
+
+  "bearer_token": "PUT_YOUR_TALKDESK_BEARER_TOKEN_HERE",
+
+  "output_base_path": "output",
+
+  "reports": [
+    "agent_activity",
+    "call_volume",
+    "queue_activity",
+    "call_details",
+    "inbound_calls",
+    "outbound_calls",
+    "service_level",
+    "call_dispositions"
+  ]
+}
+
