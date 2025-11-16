@@ -2,9 +2,10 @@
 
 Async, production‑ready Talkdesk reporting ETL with:
 
-- Two runtimes:
-  - **Local** (SQLite + filesystem)
-  - **Databricks** (Delta Lake + ADLS Gen2 + Key Vault)
+- Three implementation scenarios you can learn from and use:
+  - **Local** (SQLite + filesystem) — simple, fully self‑contained async ETL.
+  - **Databricks (driver‑async)** — Delta + ADLS Gen2 + Key Vault, using asyncio on the driver for small/medium workloads.
+  - **Databricks (Spark‑scalable pattern)** — documented design for distributing work with Spark partitions for large workloads.
 - Config‑driven endpoints and reports
 - Fully async HTTP with retries and exponential backoff
 - Structured monitoring for jobs and reports
@@ -24,7 +25,7 @@ Async, production‑ready Talkdesk reporting ETL with:
   - SQLite (`monitoring.db`) for job/report monitoring
   - CSV output on local filesystem under `output/`
 - Databricks:
-  - Delta Lake tables in `talkdesk_prod` database
+  - Delta Lake tables in `talkdesk_{ENV}` databases (e.g., `talkdesk_prod`, `talkdesk_dev`)
   - ADLS Gen2 as storage backend
   - Azure Key Vault (via Databricks secret scopes)
 
@@ -52,7 +53,9 @@ talkdesk_local/
 │   └── talkdesk_local_etl.py   # Local ETL entrypoint (async)
 │
 ├── databricks/
-│   └── talkdesk_databricks_etl.py  # Databricks ETL job
+│   ├── __init__.py
+│   ├── talkdesk_databricks_etl.py              # Databricks ETL job (driver-async, small/medium workloads)
+│   └── talkdesk_databricks_etl_distributed.py  # Databricks ETL job (Spark-distributed example)
 │
 └── ddl/                        # One‑time DDL + seeding for Delta tables
     ├── ddl_talkdesk_config.py      # report_config + endpoint_config
@@ -62,6 +65,26 @@ talkdesk_local/
 ---
 
 ## 3. High‑Level Architecture
+
+### 3.0 Three Scenarios at a Glance
+
+1. **Local async ETL (open‑source friendly)**
+   - Runs entirely on your machine with `python -m local.talkdesk_local_etl`.
+   - Uses `config.json`, SQLite monitoring, and writes CSVs under `output/`.
+   - Good for development, demos, or small production jobs that don't need Databricks.
+
+2. **Databricks driver‑async ETL (implemented)**
+   - Implemented in `databricks/talkdesk_databricks_etl.py`.
+   - Uses Delta + ADLS Gen2 + Key Vault + OAuth2 TokenManager.
+   - Async HTTP orchestration runs on the driver, tuned for a small, bounded number of reports (e.g., ~8 reports × up to ~10,000 rows).
+   - This is your primary production‑ready path today.
+
+3. **Databricks Spark‑scalable pattern (design pattern)**
+   - Demonstrated in `databricks/talkdesk_databricks_etl_distributed.py`.
+   - Shows how to scale the same logic to hundreds/thousands of reports by:
+     - Keeping `report_config`/`endpoint_config` as Spark DataFrames.
+     - Repartitioning by report (`repartition(N)`) and using `foreachPartition` to process batches of reports on workers.
+     - Running a small asyncio loop *within each partition* to parallelize API calls per worker.
 
 ### 3.1 Conceptual Flow
 
@@ -77,12 +100,14 @@ talkdesk_local/
 3. **Async HTTP Calls**
    - For each enabled report:
      - `POST` to generate `report_id`
-     - `GET` to download report JSON
+     - `GET` to download the report (CSV via Explore APIs)
    - All HTTP calls use retries with exponential backoff and respect per‑report `timeout_sec`.
 
 4. **Persistence**
-   - JSON is normalized using `pandas.json_normalize`.
-   - CSV results are written to:
+   - CSV responses from Talkdesk are:
+     - Written directly to disk in the local pipeline.
+     - Parsed with `pandas.read_csv` in the Databricks pipeline (to compute row counts before writing back to ADLS).
+   - Final CSV results are written to:
      - Local filesystem under `output/{report}/{from}_to_{to}.csv`
      - ADLS Gen2 (Databricks) under `abfss://.../talkdesk/{report}/{from}_to_{to}.csv`
 
@@ -106,18 +131,23 @@ talkdesk_local/
 **Databricks pipeline**
 
 - Uses Delta config tables (created by `ddl/*.py`):
-  - `talkdesk_prod.endpoint_config`
+  - `{DB_NAME}.endpoint_config` (e.g., `talkdesk_prod.endpoint_config`)
     - `endpoint_type, base_url, auth_endpoint, post_endpoint, get_endpoint, env`
     - Seeded with `standard` endpoints for `dev` and `prod`.
-  - `talkdesk_prod.report_config`
+  - `{DB_NAME}.report_config` (e.g., `talkdesk_prod.report_config`)
     - `report_name, enabled, endpoint_type, retries, timeout_sec, env`
     - Seeded with standard Talkdesk reports for both `dev` and `prod`.
 
 - Monitoring tables:
-  - `talkdesk_prod.job_monitoring`
+  - `{DB_NAME}.job_monitoring`
     - `run_id, from_date, to_date, start_time, end_time, status (SUCCESS/PARTIAL_SUCCESS/FAILED), total_reports, success_count, failed_count, error_message`
-  - `talkdesk_prod.report_monitoring`
+  - `{DB_NAME}.report_monitoring`
     - `run_id, report_name, from_date, to_date, start_time, end_time, status, rows_written, error_message`
+
+- Scale assumptions:
+  - The primary Databricks implementation in `talkdesk_databricks_etl.py` is tuned for a small/medium, bounded number of reports (for example, up to ~50 reports, each up to ~50,000 rows).
+  - At this scale, running the async HTTP orchestration on the driver with pandas is appropriate and simpler than a fully distributed Spark implementation.
+  - For significantly larger workloads (hundreds or thousands of reports, or much larger per‑report sizes), you should revisit the design and consider distributing work across the cluster via `foreachPartition` or similar patterns.
 
 ---
 
@@ -133,8 +163,8 @@ Key components:
 - Async flow per report:
   1. Acquire access token via `get_auth_token`.
   2. `generate_report_id` → `report_id` via POST.
-  3. `download_report` → JSON via GET.
-  4. `write_to_csv` → CSV under `output/{report}/{from}_to_{to}.csv`.
+  3. `download_report` → CSV via GET.
+  4. `write_to_csv` → writes that CSV directly under `output/{report}/{from}_to_{to}.csv`.
   5. Monitoring:
      - `start_job`, `finish_job` update job row with normalized status.
      - `start_report`, `finish_report` write each report’s status and output path.
@@ -174,7 +204,7 @@ Key functions:
     - Retries on exceptions and 5xx; no retries on 4xx.
 
 - `fetch_report_id`, `download_report`
-  - Wrap remote calls using `retry_request`.
+  - Wrap remote calls using `retry_request`; `download_report` receives CSV text for Explore APIs.
 
 - `process_report(...)`
   - Executes the report ETL for a single report name:
@@ -188,8 +218,8 @@ Key functions:
     2. Load configs for the configured `ENV` (`prod` by default).
     3. Determine date range via `get_dates()`.
     4. Create `run_id` and call `log_job_start`.
-    5. Create a single `ClientSession` and reuse the Talkdesk token across all reports.
-    6. Spawn tasks for each enabled report; gather results.
+    5. Create a single `ClientSession` and instantiate a `TokenManager` that obtains and refreshes short‑lived OAuth2 access tokens as needed.
+    6. Spawn tasks for each enabled report; each task calls `token_manager.get_token()` just‑in‑time before making Talkdesk API calls.
     7. Derive job `status` = `SUCCESS` / `FAILED` / `PARTIAL_SUCCESS`.
     8. Call `log_job_end` and log S/F counts.
     9. Any uncaught exception is caught at the top level and logged; job is marked `FAILED` with an error message.
@@ -243,7 +273,7 @@ Output:
 
 ---
 
-### 5.2 Databricks Pipeline
+### 5.2 Databricks Pipeline (Driver‑Async)
 
 **Prereqs**
 
@@ -255,12 +285,16 @@ Output:
 
 In Key Vault / Databricks secret scope `talkdesk-scope`, define:
 
-- `talkdesk-token`
-- `adls-client-id`
-- `adls-client-secret`
-- `adls-tenant-id`
-- `adls-storage-account`
-- `talkdesk-container`
+- Talkdesk OAuth2 client credentials (for short‑lived access tokens):
+  - `talkdesk-client-id`
+  - `talkdesk-client-secret`
+  - Optional: `talkdesk-token-url` (defaults to `https://api.talkdesk.com/oauth/token`)
+- ADLS / storage:
+  - `adls-client-id`
+  - `adls-client-secret`
+  - `adls-tenant-id`
+  - `adls-storage-account`
+  - `talkdesk-container`
 
 **Step 2 — DDL / Seeding (run once)**
 
@@ -269,7 +303,7 @@ Upload and run as Python notebooks or scripts:
 - `ddl/ddl_talkdesk_config.py`
 - `ddl/ddl_talkdesk_monitoring.py`
 
-These will:
+These will (for `ENV=prod`):
 
 - Create DB: `talkdesk_prod`
 - Create tables:
@@ -279,7 +313,7 @@ These will:
   - Dev + prod rows in `endpoint_config`
   - Default reports (agent_activity, call_volume, etc.) for both `dev` and `prod` in `report_config`
 
-**Step 3 — Databricks ETL job**
+**Step 3 — Databricks ETL job (driver‑async)**
 
 Upload `databricks/talkdesk_databricks_etl.py` as a notebook or script in a job.
 
@@ -290,7 +324,7 @@ dbutils.widgets.text("from_date", "", "From date (YYYY-MM-DD)")
 dbutils.widgets.text("to_date", "", "To date (YYYY-MM-DD)")
 ```
 
-Run:
+Run (driver‑async):
 
 - Default (auto yesterday → today):
 
@@ -308,6 +342,44 @@ Run:
   - Writes CSV to ADLS under:
     - `abfss://{container}@{storage_account}.dfs.core.windows.net/talkdesk/{report_name}/{from}_to_{to}.csv`
 - Job and report metrics are written to the monitoring tables.
+
+---
+
+### 5.3 Databricks Pipeline (Spark‑Distributed Example)
+
+For larger workloads (hundreds/thousands of reports, or much larger per‑report sizes), you can use the distributed variant as a scalability pattern.
+
+**How it works**
+
+- Uses the same secrets, `ENV`, and Delta tables as the driver‑async job.
+- Joins `report_config` and `endpoint_config` into a single Spark DataFrame.
+- Repartitions by report (using `PARTITION_TARGET_SIZE = 100`) and uses `foreachPartition` so each Spark executor:
+  - Creates its own `aiohttp.ClientSession` + `TokenManager`.
+  - Runs an asyncio loop to process the reports in that partition in parallel.
+  - Writes CSVs to ADLS and logs into `{DB_NAME}.report_monitoring`.
+- After all partitions complete, it derives job status from the monitoring table and calls `log_job_end`.
+
+**When to use it**
+
+- Prefer `talkdesk_databricks_etl.py` when:
+  - You have up to ~50 reports, each up to ~50k rows.
+  - You want a simpler, easier‑to‑debug driver‑based implementation.
+- Prefer `talkdesk_databricks_etl_distributed.py` when:
+  - Report counts are in the hundreds/thousands, or
+  - Per‑report CSVs are large enough that driver memory or API rate limits become concerns.
+
+**How to run**
+
+- Upload `databricks/talkdesk_databricks_etl_distributed.py` as a separate notebook or job.
+- Use the same widgets and secrets setup as the driver‑async job:
+
+  ```python
+  dbutils.widgets.text("env", "prod", "Environment (dev/prod/qa)")
+  dbutils.widgets.text("from_date", "", "From date (YYYY-MM-DD)")
+  dbutils.widgets.text("to_date", "", "To date (YYYY-MM-DD)")
+  ```
+
+- Configure the cluster with enough workers to benefit from partition‑level parallelism (e.g., several executors if you have many reports).
 
 ---
 
@@ -383,7 +455,7 @@ ORDER BY date DESC, report_name;
 
 - **Add a new environment**:
   - Add a new `env` value in both `endpoint_config` and `report_config`.
-  - Update `ENV` constant in `databricks/talkdesk_databricks_etl.py` or pass it via a job parameter.
+  - Use the Databricks `env` widget (read by `databricks/talkdesk_databricks_etl.py`) to select which `{DB_NAME} = talkdesk_{ENV}` database to target.
 
 - **Change retry behavior**:
   - Adjust `_with_retries` in `local/async_utils.py` and/or `retry_request` in `databricks/talkdesk_databricks_etl.py`.

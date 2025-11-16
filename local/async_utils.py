@@ -88,10 +88,10 @@ async def generate_report_id(session, report_name, from_date, to_date, token, co
         async with session.post(url, headers=headers, json=body) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                # Retry only on 5xx; 4xx are treated as permanent.
-                if 500 <= resp.status < 600:
+                # Retry on 5xx and 429; treat other 4xx as permanent.
+                if resp.status == 429 or 500 <= resp.status < 600:
                     raise aiohttp.ClientError(
-                        f"Server error {resp.status} for {report_name}: {text}"
+                        f"Server/Rate error {resp.status} for {report_name}: {text}"
                     )
                 print(f"Failed report_id for {report_name}: {text}")
                 return None
@@ -107,7 +107,7 @@ async def download_report(session, report_id, token, config):
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+        "Accept": "text/csv",
     }
 
     params = {"report_id": report_id}
@@ -116,20 +116,25 @@ async def download_report(session, report_id, token, config):
         async with session.get(url, headers=headers, params=params) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                if 500 <= resp.status < 600:
+                if resp.status == 429 or 500 <= resp.status < 600:
                     raise aiohttp.ClientError(
-                        f"Server error {resp.status} for report_id={report_id}: {text}"
+                        f"Server/Rate error {resp.status} for report_id={report_id}: {text}"
                     )
                 print(f"GET failed for report_id={report_id}: {text}")
                 return None
 
-            return await resp.json()
+            # For Explore APIs returning CSV, we want the raw text.
+            return await resp.text()
 
     return await _with_retries(_op, label=f"download_report:{report_id}")
 
 
-def write_to_csv(data, output_path):
+def write_to_csv(csv_text: str, output_path: str) -> None:
+    """
+    Persist raw CSV text returned by the API to disk.
+    The Talkdesk Explore API already returns CSV, so no transformation is needed here.
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    df = pd.json_normalize(data)
-    df.to_csv(output_path, index=False)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(csv_text)
     print(f"Saved → {output_path}")

@@ -4,9 +4,10 @@
 
 import aiohttp
 import asyncio
+import io
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -14,14 +15,21 @@ from pyspark.sql import Row
 
 
 SECRET_SCOPE = "talkdesk-scope"
-DB_NAME = "talkdesk_prod"
+TALKDESK_TOKEN_URL = "https://api.talkdesk.com/oauth/token"  # Override if your tenant URL differs
 
 
 # =====================================================================
 # 01 — ENV + SECRETS / ADLS HELPERS
 # =====================================================================
 
-ENV = "prod"
+try:
+    dbutils.widgets.text("env", "prod", "Environment (dev/prod/qa)")
+    ENV = dbutils.widgets.get("env") or "prod"
+except NameError:
+    # dbutils not available (e.g., unit tests or local execution); default to prod.
+    ENV = "prod"
+
+DB_NAME = f"talkdesk_{ENV}"
 
 
 def load_secrets() -> Dict[str, str]:
@@ -31,7 +39,12 @@ def load_secrets() -> Dict[str, str]:
     """
     scope = SECRET_SCOPE
     keys = {
-        "talkdesk_token": "talkdesk-token",
+        # Talkdesk OAuth client credentials (for short-lived access tokens)
+        "talkdesk_client_id": "talkdesk-client-id",
+        "talkdesk_client_secret": "talkdesk-client-secret",
+        # Optional override for token URL; falls back to TALKDESK_TOKEN_URL constant if missing
+        "talkdesk_token_url": "talkdesk-token-url",
+        # ADLS / storage
         "client_id": "adls-client-id",
         "client_secret": "adls-client-secret",
         "tenant_id": "adls-tenant-id",
@@ -48,10 +61,74 @@ def load_secrets() -> Dict[str, str]:
         except Exception:
             missing.append(secret_name)
 
-    if missing:
-        raise RuntimeError(f"Missing required secrets: {', '.join(missing)}")
+    # Allow talkdesk_token_url to be optional; others are required.
+    required_missing = [m for m in missing if m != "talkdesk-token-url"]
+    if required_missing:
+        raise RuntimeError(f"Missing required secrets: {', '.join(required_missing)}")
+
+    # Default token URL if secret not present
+    if "talkdesk_token_url" not in values or not values.get("talkdesk_token_url"):
+        values["talkdesk_token_url"] = TALKDESK_TOKEN_URL
 
     return values
+
+
+class TokenManager:
+    """
+    Async-safe OAuth2 client-credentials token manager for Talkdesk.
+    Ensures a valid access token is available and refreshed as needed.
+    """
+
+    def __init__(self, session: aiohttp.ClientSession, client_id: str, client_secret: str, token_url: str):
+        self._session = session
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._token_url = token_url
+
+        self._access_token: str | None = None
+        self._expires_at: datetime = datetime.now(timezone.utc)
+        self._lock = asyncio.Lock()
+
+    async def _refresh_token(self) -> None:
+        """Fetch a new token from the OAuth2 token endpoint."""
+        logger.info("Talkdesk access token expired or missing. Refreshing...")
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+        }
+
+        async with self._session.post(self._token_url, data=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+            access_token = data.get("access_token")
+            if not access_token:
+                raise RuntimeError("Token endpoint response missing 'access_token'")
+
+            expires_in = int(data.get("expires_in", 3600))
+            # Refresh 5 minutes before real expiry as a safety buffer
+            self._access_token = access_token
+            self._expires_at = datetime.now(timezone.utc) + timedelta(
+                seconds=max(expires_in - 300, 60)
+            )
+            logger.info("Talkdesk access token refreshed successfully.")
+
+    async def get_token(self) -> str:
+        """
+        Return a valid access token, refreshing it if needed.
+        Safe to call concurrently from multiple coroutines.
+        """
+        if self._access_token and datetime.now(timezone.utc) < self._expires_at:
+            return self._access_token
+
+        async with self._lock:
+            # Re-check after acquiring the lock; another task may have refreshed it.
+            if self._access_token and datetime.now(timezone.utc) < self._expires_at:
+                return self._access_token
+
+            await self._refresh_token()
+            return self._access_token
 
 
 def configure_adls(
@@ -133,7 +210,7 @@ def log_job_start(run_id: str, dfrom: str, dto: str, total: int) -> None:
         run_id=run_id,
         from_date=dfrom,
         to_date=dto,
-        start_time=datetime.utcnow(),
+        start_time=datetime.now(timezone.utc),
         end_time=None,
         status="RUNNING",
         total_reports=total,
@@ -190,8 +267,8 @@ def log_report(
         report_name=report_name,
         from_date=dfrom,
         to_date=dto,
-        start_time=datetime.utcnow(),
-        end_time=datetime.utcnow(),
+        start_time=datetime.now(timezone.utc),
+        end_time=datetime.now(timezone.utc),
         status=status,
         rows_written=rows,
         error_message=error,
@@ -204,11 +281,6 @@ def log_report(
 # =====================================================================
 # 06 — HTTP + RETRY UTILITIES
 # =====================================================================
-
-
-def get_token():
-    return dbutils.secrets.get("talkdesk-scope", "talkdesk-token")
-
 
 async def retry_request(
     session,
@@ -228,12 +300,21 @@ async def retry_request(
             timeout = aiohttp.ClientTimeout(total=timeout_sec) if timeout_sec else None
             resp = await session.request(method, url, timeout=timeout, **kwargs)
 
-            if resp.status < 500:
+            # Handle 429 (Too Many Requests) and 5xx as retriable.
+            if resp.status == 429:
+                retry_after = resp.headers.get("Retry-After")
+                logger.warning(
+                    f"HTTP {method} {url} attempt {attempt} got 429 Too Many Requests "
+                    f"(Retry-After={retry_after})"
+                )
+                # We'll sleep below using exponential backoff; Retry-After is advisory only here.
+            elif resp.status < 500:
+                # 2xx/3xx/4xx (except 429) are treated as final.
                 return resp
-
-            logger.warning(
-                f"HTTP {method} {url} attempt {attempt} got {resp.status}"
-            )
+            else:
+                logger.warning(
+                    f"HTTP {method} {url} attempt {attempt} got {resp.status}"
+                )
         except Exception as exc:
             logger.warning(
                 f"HTTP {method} {url} attempt {attempt} failed: {exc}"
@@ -278,9 +359,12 @@ async def download_report(
     ep: dict,
     token: str,
     report_id: str,
-) -> dict | None:
+) -> str | None:
     url = ep["base_url"] + ep["get_endpoint"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "text/csv",
+    }
 
     resp = await retry_request(
         session,
@@ -294,7 +378,8 @@ async def download_report(
     )
     if not resp:
         return None
-    return await resp.json()
+    # Explore APIs can return CSV directly; capture raw text.
+    return await resp.text()
 
 
 # =====================================================================
@@ -309,18 +394,19 @@ async def process_report(
     ep: dict,
     dfrom: str,
     dto: str,
-    token_val: str,
+    token_manager: TokenManager,
     storage_account: str,
     container: str,
 ) -> bool:
     try:
         logger.info(f"[{run_id}] Starting report: {rpt.report_name} ({dfrom} -> {dto})")
 
+        # Get a fresh or cached Talkdesk access token.
+        token_val = await token_manager.get_token()
+
         # Step 1: Generate Report ID
         logger.info(f"[{run_id}] {rpt.report_name}: requesting report_id")
-        r_id = await fetch_report_id(
-            session, ep, token_val, rpt.report_name, dfrom, dto
-        )
+        r_id = await fetch_report_id(session, ep, token_val, rpt.report_name, dfrom, dto)
         if not r_id:
             log_report(
                 run_id,
@@ -333,7 +419,7 @@ async def process_report(
             )
             return False
 
-        # Step 2: Download Data
+        # Step 2: Download Data (CSV)
         data = await download_report(session, ep, token_val, r_id)
         if not data:
             log_report(
@@ -346,9 +432,9 @@ async def process_report(
                 dto,
             )
             return False
-        logger.info(f"[{run_id}] {rpt.report_name}: data downloaded, normalizing JSON")
+        logger.info(f"[{run_id}] {rpt.report_name}: CSV downloaded, loading into DataFrame")
 
-        df = pd.json_normalize(data)
+        df = pd.read_csv(io.StringIO(data))
         logger.info(f"[{run_id}] {rpt.report_name}: normalized to {len(df)} rows")
 
         # Step 3: Write to ADLS
@@ -406,7 +492,7 @@ def get_dates() -> Tuple[str, str]:
         # Widgets not defined or not available; fall back to auto dates.
         pass
 
-    today = datetime.utcnow()
+    today = datetime.now(timezone.utc)
     yesterday = today - timedelta(days=1)
     return yesterday.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
@@ -439,7 +525,12 @@ async def main() -> None:
 
     try:
         async with aiohttp.ClientSession() as session:
-            token_val = secrets["talkdesk_token"]
+            token_manager = TokenManager(
+                session,
+                secrets["talkdesk_client_id"],
+                secrets["talkdesk_client_secret"],
+                secrets["talkdesk_token_url"],
+            )
 
             tasks = []
             for _, rpt in report_cfg.iterrows():
@@ -458,7 +549,7 @@ async def main() -> None:
                         ep,
                         dfrom,
                         dto,
-                        token_val,
+                        token_manager,
                         storage_account,
                         container,
                     )
