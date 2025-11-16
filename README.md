@@ -92,21 +92,21 @@ talkdesk_local/
 flowchart LR
   TD[(Talkdesk APIs)]
 
-  subgraph Local[Local async ETL (Python + SQLite)]
+  subgraph Local["Local async ETL (Python + SQLite)"]
     L_ETL[Local ETL\n(local.talkdesk_local_etl.py)]
     L_CFG[Config\n(config.json)]
     L_OUT[(CSV files\noutput/)]
     L_MON[(SQLite\nmonitoring.db)]
   end
 
-  subgraph DB_Driver[Databricks driver-async ETL]
+  subgraph DB_Driver["Databricks driver-async ETL"]
     D_ETL[Driver ETL\n(talkdesk_databricks_etl.py)]
     D_CFG[(Delta config\nreport_config + endpoint_config)]
     D_MON[(Delta monitoring\njob_monitoring + report_monitoring)]
     ADLS[(ADLS Gen2)]
   end
 
-  subgraph DB_Dist[Databricks Spark-distributed ETL]
+  subgraph DB_Dist["Databricks Spark-distributed ETL"]
     SD_ETL[Distributed ETL\n(talkdesk_databricks_etl_distributed.py)]
     SD_PART[Workers\n(foreachPartition + asyncio)]
   end
