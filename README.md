@@ -86,6 +86,51 @@ talkdesk_local/
      - Repartitioning by report (`repartition(N)`) and using `foreachPartition` to process batches of reports on workers.
      - Running a small asyncio loop *within each partition* to parallelize API calls per worker.
 
+### 3.0.1 Architecture Diagram
+
+```mermaid
+flowchart LR
+  TD[Talkdesk APIs]
+
+  subgraph Local[Local async ETL]
+    L_ETL[local.talkdesk_local_etl.py]
+    L_CFG[config.json]
+    L_OUT[(output/ CSV)]
+    L_MON[(monitoring.db)]
+  end
+
+  subgraph DB_Driver[Databricks driver-async ETL]
+    D_ETL[databricks/talkdesk_databricks_etl.py]
+    D_CFG[(Delta: {DB_NAME}.report_config<br/>+ {DB_NAME}.endpoint_config)]
+    D_MON[(Delta: {DB_NAME}.job_monitoring<br/>+ {DB_NAME}.report_monitoring)]
+    ADLS[(ADLS Gen2)]
+  end
+
+  subgraph DB_Dist[Databricks Spark-distributed ETL]
+    SD_ETL[databricks/talkdesk_databricks_etl_distributed.py]
+    SD_PART[foreachPartition + asyncio per partition]
+  end
+
+  %% Local flow
+  TD <-- async HTTP (CSV) --> L_ETL
+  L_ETL --> L_OUT
+  L_ETL --> L_MON
+  L_ETL --> L_CFG
+
+  %% Databricks driver-async flow
+  TD <-- async HTTP (CSV) --> D_ETL
+  D_ETL --> ADLS
+  D_ETL --> D_MON
+  D_ETL --> D_CFG
+
+  %% Databricks distributed flow
+  TD <-- async HTTP (CSV) --> SD_PART
+  SD_ETL --> SD_PART
+  SD_PART --> ADLS
+  SD_PART --> D_MON
+  SD_ETL --> D_CFG
+```
+
 ### 3.1 Conceptual Flow
 
 1. **Config & Secrets**
@@ -470,3 +515,17 @@ ORDER BY date DESC, report_name;
 - `ddl/ddl_talkdesk_monitoring.py`: one‑time script to create monitoring tables.
 - `local/talkdesk_local_etl.py`: local entrypoint (run via `python -m local.talkdesk_local_etl`).
 - `databricks/talkdesk_databricks_etl.py`: main Databricks job script.
+
+## 9. References
+
+- Talkdesk Developers: https://developers.talkdesk.com/
+- Talkdesk Explore API: https://developers.talkdesk.com/docs/explore-api
+- Python asyncio: https://docs.python.org/3/library/asyncio.html
+- aiohttp client: https://docs.aiohttp.org/en/stable/
+- Apache Spark SQL: https://spark.apache.org/docs/latest/sql-programming-guide.html
+- Delta Lake: https://docs.delta.io/latest/index.html
+- Databricks widgets: https://docs.databricks.com/en/notebooks/widgets.html
+- Databricks secret scopes: https://docs.databricks.com/en/security/secrets/secret-scopes.html
+- ADLS Gen2 + Databricks: https://learn.microsoft.com/azure/databricks/connect/storage/azure-storage
+- pandas I/O: https://pandas.pydata.org/docs/user_guide/io.html
+- SQLite: https://www.sqlite.org/docs.html
