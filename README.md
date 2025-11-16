@@ -90,45 +90,57 @@ talkdesk_local/
 
 ```mermaid
 flowchart LR
-  TD[Talkdesk APIs]
+  TD[(Talkdesk APIs)]
 
-  subgraph Local[Local async ETL]
-    L_ETL[local.talkdesk_local_etl.py]
-    L_CFG[config.json]
-    L_OUT[(output/ CSV)]
-    L_MON[(monitoring.db)]
+  subgraph Local[Local async ETL (Python + SQLite)]
+    L_ETL[Local ETL\n(local.talkdesk_local_etl.py)]
+    L_CFG[Config\n(config.json)]
+    L_OUT[(CSV files\noutput/)]
+    L_MON[(SQLite\nmonitoring.db)]
   end
 
   subgraph DB_Driver[Databricks driver-async ETL]
-    D_ETL[databricks/talkdesk_databricks_etl.py]
-    D_CFG[(Delta: report_config + endpoint_config)]
-    D_MON[(Delta: job_monitoring + report_monitoring)]
+    D_ETL[Driver ETL\n(talkdesk_databricks_etl.py)]
+    D_CFG[(Delta config\nreport_config + endpoint_config)]
+    D_MON[(Delta monitoring\njob_monitoring + report_monitoring)]
     ADLS[(ADLS Gen2)]
   end
 
   subgraph DB_Dist[Databricks Spark-distributed ETL]
-    SD_ETL[databricks/talkdesk_databricks_etl_distributed.py]
-    SD_PART[foreachPartition + asyncio per partition]
+    SD_ETL[Distributed ETL\n(talkdesk_databricks_etl_distributed.py)]
+    SD_PART[Workers\n(foreachPartition + asyncio)]
   end
 
   %% Local flow
-  TD <-- async HTTP (CSV) --> L_ETL
+  TD <-- HTTP (CSV) --> L_ETL
   L_ETL --> L_OUT
   L_ETL --> L_MON
   L_ETL --> L_CFG
 
   %% Databricks driver-async flow
-  TD <-- async HTTP (CSV) --> D_ETL
+  TD <-- HTTP (CSV) --> D_ETL
   D_ETL --> ADLS
   D_ETL --> D_MON
   D_ETL --> D_CFG
 
   %% Databricks distributed flow
-  TD <-- async HTTP (CSV) --> SD_PART
+  TD <-- HTTP (CSV) --> SD_PART
   SD_ETL --> SD_PART
   SD_PART --> ADLS
   SD_PART --> D_MON
   SD_ETL --> D_CFG
+
+  %% Styling to highlight tools
+  classDef api fill:#ffe6f0,stroke:#c2185b,stroke-width:1px;
+  classDef etl fill:#e3f2fd,stroke:#1565c0,stroke-width:1px;
+  classDef storage fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
+  classDef meta fill:#f3e5f5,stroke:#6a1b9a,stroke-width:1px;
+
+  class TD api;
+  class L_ETL,D_ETL,SD_ETL,SD_PART etl;
+  class L_CFG,L_OUT,L_MON meta;
+  class D_CFG,D_MON meta;
+  class ADLS storage;
 ```
 
 ### 3.1 Conceptual Flow
