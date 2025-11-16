@@ -101,8 +101,8 @@ flowchart LR
 
   subgraph DB_Driver[Databricks driver-async ETL]
     D_ETL[databricks/talkdesk_databricks_etl.py]
-    D_CFG[(Delta: {DB_NAME}.report_config<br/>+ {DB_NAME}.endpoint_config)]
-    D_MON[(Delta: {DB_NAME}.job_monitoring<br/>+ {DB_NAME}.report_monitoring)]
+    D_CFG[(Delta: report_config + endpoint_config)]
+    D_MON[(Delta: job_monitoring + report_monitoring)]
     ADLS[(ADLS Gen2)]
   end
 
